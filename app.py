@@ -538,14 +538,15 @@ def tab_market_overview():
         bgcolor=INK_RAISED,
     )
 
-    fig.update_layout(
-        **PLOTLY_LAYOUT,
+    layout = {**PLOTLY_LAYOUT}
+    layout.update(
         height=560,
         xaxis_title="Price (SAR)",
         yaxis_title="Number of Customer Reviews",
         showlegend=True,
         legend_title_text="Price Tier",
     )
+    fig.update_layout(**layout)
     st.plotly_chart(fig, use_container_width=True)
 
     # ---- Top 10 sellers table ----
@@ -634,8 +635,11 @@ def tab_pricing():
         yaxis="y2",
         hovertemplate="<b>%{x}</b><br>%{y:,} total reviews<extra></extra>",
     ))
-    fig.update_layout(
-        **PLOTLY_LAYOUT,
+    # Build layout by merging the base theme with chart-specific overrides.
+    # Cannot pass **PLOTLY_LAYOUT alongside yaxis= / legend= because those keys
+    # already exist in PLOTLY_LAYOUT — Python rejects duplicate kwargs.
+    layout = {**PLOTLY_LAYOUT}
+    layout.update(
         height=420,
         title="Competitor catalog distribution by price tier",
         yaxis=dict(title="Products", gridcolor=INK_LINE, tickfont=dict(color=BONE_DIM)),
@@ -643,6 +647,7 @@ def tab_pricing():
                     gridcolor="rgba(0,0,0,0)", tickfont=dict(color=BONE_DIM)),
         legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
     )
+    fig.update_layout(**layout)
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
@@ -744,8 +749,9 @@ def tab_scent_gaps():
         textfont=dict(color=BONE, family="Manrope"),
         hovertemplate="<b>%{y}</b><br>%{x} mentions across 75 products<extra></extra>",
     ))
-    fig.update_layout(
-        **PLOTLY_LAYOUT,
+    # Merge-then-pass pattern (see tab_pricing for why).
+    layout = {**PLOTLY_LAYOUT}
+    layout.update(
         height=440,
         title="The saturated Gulf palette — what every competitor builds with",
         xaxis_title="Mentions across the 75-product catalog",
@@ -753,6 +759,7 @@ def tab_scent_gaps():
                    tickfont=dict(color=BONE)),
         showlegend=False,
     )
+    fig.update_layout(**layout)
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown(
