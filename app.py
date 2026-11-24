@@ -2,23 +2,27 @@
 Competitor Intelligence Dashboard
 ==================================
 A bilingual (English / Egyptian Arabic) strategic dashboard built on the
-Faisal AlDayel scraped dataset (75 products).
+Faisal AlDayel catalog, scraped with scraper/scrape_faisalaldayel.py.
 
 Aesthetic direction: editorial luxury — dark, serif display, single warm accent.
 Built deliberately to look like a fragrance-house strategy deck, not a SaaS tool.
+
+Every number shown on the page is computed from the CSV at load time, so a
+fresh scrape updates the charts and the strategy text together.
 
 Deployment
 ----------
     pip install -r requirements.txt
     streamlit run app.py
 
-For Streamlit Cloud: push app.py, requirements.txt, and
+For Streamlit Cloud: push app.py, fragrance_notes.py, requirements.txt and
 faisalaldayel_intel.csv to a GitHub repo and connect at share.streamlit.io
 """
 
 from __future__ import annotations
 
-import base64
+import html
+import json
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +30,20 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+from fragrance_notes import find_notes
+
+APP_DIR = Path(__file__).resolve().parent
+
+# Price tier label -> its SAR range (used in sentences)
+TIER_RANGES = {
+    "Entry (under 150)": "under-150",
+    "Mid (150–250)": "150–250",
+    "Premium (250–400)": "250–400",
+    "Luxury (400–600)": "400–600",
+    "Top (600–1000)": "600–1,000",
+    "Flagship (1000+)": "1,000+",
+}
 
 # ============================================================================
 # PAGE CONFIG — must be the first Streamlit call
@@ -335,11 +353,10 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 @st.cache_data
 def load_data() -> pd.DataFrame:
-    """Load the scraped CSV. Falls back to relative path for Streamlit Cloud."""
+    """Load the scraped CSV from next to app.py (or a data/ folder)."""
     candidates = [
-        Path("faisalaldayel_intel.csv"),
-        Path("data/faisalaldayel_intel.csv"),
-        Path("/mnt/user-data/uploads/faisalaldayel_intel.csv"),
+        APP_DIR / "faisalaldayel_intel.csv",
+        APP_DIR / "data" / "faisalaldayel_intel.csv",
     ]
     for p in candidates:
         if p.exists():
@@ -379,14 +396,76 @@ def load_data() -> pd.DataFrame:
 
     # Price tier label for the scatter plot
     bins = [0, 150, 250, 400, 600, 1000, 5000]
-    labels = ["Entry (<150)", "Mid (150–250)", "Premium (250–400)",
-              "Luxury (400–600)", "Top (600–1000)", "Flagship (1000+)"]
+    labels = list(TIER_RANGES)
     df["tier"] = pd.cut(df["price_sar"], bins=bins, labels=labels)
+
+    # Fragrance notes, detected with whole-word matching (fragrance_notes.py)
+    text = (df.get("description", pd.Series("", index=df.index)).fillna("").astype(str) + " " +
+            df.get("fragrance_notes_raw", pd.Series("", index=df.index)).fillna("").astype(str)
+                .str.replace("|", " ", regex=False))
+    df["has_text"] = text.str.strip().str.len() > 0
+    df["notes_list"] = text.apply(find_notes)
+
+    # Customer review texts, when the scraper managed to collect them
+    def _reviews(raw):
+        try:
+            val = json.loads(raw) if isinstance(raw, str) else []
+            return [t for t in val if isinstance(t, str) and t.strip()]
+        except json.JSONDecodeError:
+            return []
+    df["reviews_list"] = df.get("review_texts", pd.Series("[]", index=df.index)).apply(_reviews)
 
     return df
 
 
 df = load_data()
+
+
+# ============================================================================
+# FACTS — every number quoted in the strategy text comes from here
+# ============================================================================
+
+def ar_num(value) -> str:
+    """Western digits -> Arabic-Indic digits, keeping separators."""
+    return str(value).translate(str.maketrans("0123456789,.", "٠١٢٣٤٥٦٧٨٩,٫"))
+
+
+def fmt_price(p: float) -> str:
+    return f"{p:,.2f}".rstrip("0").rstrip(".")
+
+
+def compute_facts(d: pd.DataFrame) -> dict:
+    above = d[d["price_sar"] > 400]
+    premium = d[(d["price_sar"] > 250) & (d["price_sar"] <= 400)]
+    top = d.sort_values("review_count", ascending=False).iloc[0]
+    by_tier = d.groupby("tier", observed=True)["review_count"].sum()
+    total_reviews = int(d["review_count"].sum())
+    top3 = d.sort_values(["seller_score", "review_count"], ascending=False).head(3)
+    snapshot = pd.to_datetime(d.get("scraped_at"), errors="coerce").max()
+    return dict(
+        n=len(d),
+        total_reviews=total_reviews,
+        n_above=len(above),
+        reviews_above=int(above["review_count"].sum()),
+        n_premium=len(premium),
+        reviews_premium=int(premium["review_count"].sum()),
+        top_name=str(top["display_name"]),
+        top_price=float(top["price_sar"]),
+        top_reviews=int(top["review_count"]),
+        cash_tier=TIER_RANGES.get(str(by_tier.idxmax()), "") if total_reviews else "",
+        cash_tier_ar=(ar_num(TIER_RANGES.get(str(by_tier.idxmax()), ""))
+                      .replace("under-", "أقل من ").replace("+", " فأكثر")) if total_reviews else "",
+        cash_share=(by_tier.max() / total_reviews) if total_reviews else 0.0,
+        top3_prices=sorted(set(top3["price_sar"].round(2))),
+        min_price=float(d["price_sar"].min()),
+        max_price=float(d["price_sar"].max()),
+        n_with_text=int(d["has_text"].sum()),
+        n_reviews_text=int(d["reviews_list"].str.len().sum()),
+        snapshot=snapshot.strftime("%b %Y") if pd.notna(snapshot) else "unknown date",
+    )
+
+
+F = compute_facts(df)
 
 
 # ============================================================================
@@ -424,6 +503,9 @@ with st.sidebar:
             </div>
             <div style='font-size: 0.8rem; color: {BONE_DIM}; margin-top: 0.3rem;'>
                 Faisal AlDayel · faisalaldayel.com
+            </div>
+            <div style='font-size: 0.75rem; color: {BONE_DIM}; margin-top: 0.2rem;'>
+                Snapshot: {F["snapshot"]}
             </div>
         </div>
     """, unsafe_allow_html=True)
@@ -466,7 +548,7 @@ def tab_market_overview():
                 unsafe_allow_html=True)
     st.markdown("# Market Overview")
     st.markdown(
-        '<p class="lede">A 24-year-old Saudi house, 75 active SKUs, '
+        f'<p class="lede">A Saudi house founded in 2002, {F["n"]} active SKUs, '
         'and a catalog whose silhouette tells you exactly where the opportunity lives.</p>',
         unsafe_allow_html=True,
     )
@@ -518,19 +600,23 @@ def tab_market_overview():
                       "Rating: %{customdata[1]:.2f} / 5<extra></extra>",
     )
 
-    # Highlight the empty premium tiers with annotation
+    # Annotations: positions and wording come from the data
+    y_top = max(F["top_reviews"], 1)
+    if F["max_price"] > 400:
+        fig.add_annotation(
+            x=400 + (F["max_price"] - 400) / 2, y=y_top * 0.7,
+            text=(f"◈   The empty rung<br><span style='font-size:11px;'>"
+                  f"{F['n_above']} products, {F['reviews_above']} reviews above 400 SAR</span>"),
+            showarrow=True, arrowhead=0, arrowcolor=BRONZE, arrowwidth=1,
+            ax=0, ay=-30,
+            font=dict(family="Cormorant Garamond, serif", size=15, color=BRONZE),
+            align="left", bordercolor=BRONZE, borderwidth=1, borderpad=8,
+            bgcolor=INK_RAISED,
+        )
     fig.add_annotation(
-        x=700, y=350,
-        text="◈   The empty rung<br><span style='font-size:11px;'>almost no proven sales above 400 SAR</span>",
-        showarrow=True, arrowhead=0, arrowcolor=BRONZE, arrowwidth=1,
-        ax=120, ay=-40,
-        font=dict(family="Cormorant Garamond, serif", size=15, color=BRONZE),
-        align="left", bordercolor=BRONZE, borderwidth=1, borderpad=8,
-        bgcolor=INK_RAISED,
-    )
-    fig.add_annotation(
-        x=160, y=470,
-        text="◈   The cash cow<br><span style='font-size:11px;'>142–200 SAR drives the entire business</span>",
+        x=F["top_price"], y=F["top_reviews"],
+        text=(f"◈   The cash cow<br><span style='font-size:11px;'>"
+              f"{F['cash_tier']} SAR holds {F['cash_share']:.0%} of all reviews</span>"),
         showarrow=True, arrowhead=0, arrowcolor=BRONZE, arrowwidth=1,
         ax=180, ay=-15,
         font=dict(family="Cormorant Garamond, serif", size=15, color=BRONZE),
@@ -547,7 +633,7 @@ def tab_market_overview():
         legend_title_text="Price Tier",
     )
     fig.update_layout(**layout)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # ---- Top 10 sellers table ----
     st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
@@ -570,7 +656,7 @@ def tab_market_overview():
 
     st.dataframe(
         display,
-        use_container_width=True,
+        width="stretch",
         height=420,
         column_config={
             "Product": st.column_config.TextColumn("Product", width="medium"),
@@ -578,16 +664,23 @@ def tab_market_overview():
             "Rating": st.column_config.NumberColumn("Rating", format="%.2f ★"),
             "Reviews": st.column_config.NumberColumn("Reviews", format="%d"),
             "Score": st.column_config.ProgressColumn(
-                "Strength Score", format="%.3f", min_value=4.9, max_value=5.0,
+                "Strength Score", format="%.3f",
+                min_value=float(display["Score"].min()) - 0.01,
+                max_value=float(display["Score"].max()),
             ),
         },
     )
 
+    prices = F["top3_prices"]
+    if len(prices) == 1:
+        lead = f"the top three sellers each cost {fmt_price(prices[0])} SAR"
+    else:
+        lead = f"the top three sellers cost {' / '.join(fmt_price(p) for p in prices)} SAR"
     st.markdown(
         '<p class="fineprint">'
-        'Read this table sideways: the top three sellers each cost 142.50 SAR. '
-        'Faisal AlDayel wins on volume in a single narrow band — and is essentially absent '
-        'from the territory a heritage luxury brand should occupy.'
+        f'Read this table sideways: {lead}, and {F["cash_share"]:.0%} of all reviews sit in '
+        f'the {F["cash_tier"]} SAR band. Faisal AlDayel wins on volume in a narrow band, '
+        f'with only {F["n_above"]} products above 400 SAR.'
         '</p>',
         unsafe_allow_html=True,
     )
@@ -602,7 +695,8 @@ def tab_pricing():
                 unsafe_allow_html=True)
     st.markdown("# Pricing Strategy")
     st.markdown(
-        '<p class="lede">The competitor has never proven they can sell above 400 SAR. '
+        f'<p class="lede">The competitor has {F["n_above"]} products above 400 SAR, with '
+        f'{F["reviews_above"]} reviews between them. They have barely tested that band. '
         "That isn't a failure to copy. It's a doorway to walk through.</p>",
         unsafe_allow_html=True,
     )
@@ -648,7 +742,7 @@ def tab_pricing():
         legend=dict(orientation="h", y=1.12, x=0, bgcolor="rgba(0,0,0,0)"),
     )
     fig.update_layout(**layout)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
 
@@ -656,30 +750,30 @@ def tab_pricing():
     if lang == "English":
         st.markdown("## The Three Pricing Moves")
 
-        st.markdown("""
+        st.markdown(f"""
         <div class="strategy-card">
             <span class="label">Move 01 · Flagship</span>
             <h4>Price the flagship at 1,200 – 1,450 SAR.</h4>
-            <p>Above the competitor's entire ceiling. Their products over 400 SAR have <b>34 combined customer reviews</b> — versus 431 reviews for a single 142 SAR bottle. The 400–900 SAR band is not a gap, it is a graveyard. Pricing into a proven failure zone is not a strategy.</p>
+            <p>Above the competitor's entire ceiling ({fmt_price(F["max_price"])} SAR). Their {F["n_above"]} products over 400 SAR have <b>{F["reviews_above"]} combined customer reviews</b>, versus {F["top_reviews"]} reviews for a single {fmt_price(F["top_price"])} SAR bottle. With so few products there, this is not proof the band fails. It is proof nobody has seriously competed in it.</p>
             <p>Pricing at 1,200+ SAR changes the conversation entirely. The customer is no longer comparing you to Faisal AlDayel. They are comparing you to international houses — which is precisely where a heritage brand wants to be compared.</p>
         </div>
         """, unsafe_allow_html=True)
 
-        st.markdown("""
+        st.markdown(f"""
         <div class="strategy-card">
             <span class="label">Move 02 · Discovery Set</span>
             <h4>Launch a discovery set at 350 – 450 SAR.</h4>
-            <p>Four 5ml miniatures. Sits above the competitor's entire entry and mid tier (preserving the premium signal), and inside the premium tier where they have <b>only 6 products and 69 total reviews</b>. Customers who want to spend in the 300–400 SAR range cannot find anything they trust at Faisal AlDayel. They will find you.</p>
-            <p>This is the trial bridge to the 1,400 SAR flagship — and the only acceptable place to engage on price.</p>
+            <p>Four 5ml miniatures. Sits above the competitor's entry and mid tiers (preserving the premium signal), and inside the 250–400 SAR tier where they have <b>only {F["n_premium"]} products and {F["reviews_premium"]} total reviews</b>. A customer ready to spend 300–400 SAR has little to choose from at Faisal AlDayel.</p>
+            <p>This is the trial bridge to the flagship, and the only place worth engaging on price.</p>
         </div>
         """, unsafe_allow_html=True)
 
-        st.markdown("""
+        st.markdown(f"""
         <div class="strategy-card">
             <span class="label">Move 03 · The Forbidden Zone</span>
-            <h4>Do not enter the 142 – 250 SAR tier.</h4>
-            <p>Two reasons. First: you cannot win on volume against a 24-year-old established house with proven distribution muscle. Second, and more important: once a brand is anchored at 200 SAR in the customer's mind, <b>it can never move up.</b></p>
-            <p>You can always lower prices later. You cannot raise them.</p>
+            <h4>Do not enter the {fmt_price(F["min_price"])} – 250 SAR tier.</h4>
+            <p>Two reasons. First: you cannot win on volume against an established house founded in 2002, which already holds {F["cash_share"]:.0%} of its reviews in the {F["cash_tier"]} SAR band. Second, and more important: once a brand is anchored at 200 SAR in the customer's mind, <b>moving up is very hard.</b></p>
+            <p>You can always lower prices later. Raising them is far harder.</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -694,7 +788,7 @@ def tab_pricing():
         <div class="strategy-card arabic-block">
             <span class="label">الخطوة الأولى · المنتج الرئيسي</span>
             <h4 style='font-family: Tajawal; font-weight: 700;'>سعّر المنتج الرئيسي بين ١,٢٠٠ و ١,٤٥٠ ريال.</h4>
-            <p>فوق سقف المنافس كله. منتجاتهم اللي فوق ٤٠٠ ريال جمعوا مع بعض <b>٣٤ مراجعة بس</b> — في الوقت اللي عبوة واحدة بـ ١٤٢ ريال عندها ٤٣١ مراجعة. الفئة بين ٤٠٠ و ٩٠٠ ريال مش فرصة، دي مقبرة. تنزل تنافس في منطقة فشل مُثبتة؟ ده مش تخطيط.</p>
+            <p>فوق سقف المنافس كله ({ar_num(fmt_price(F["max_price"]))} ريال). عنده {ar_num(F["n_above"])} منتجات بس فوق ٤٠٠ ريال، وجمعوا مع بعض <b>{ar_num(F["reviews_above"])} مراجعة بس</b>، في الوقت اللي عبوة واحدة بـ {ar_num(fmt_price(F["top_price"]))} ريال عليها {ar_num(F["top_reviews"])} مراجعة. بعدد منتجات قليل كده، ده مش دليل إن الفئة دي فاشلة. ده دليل إن محدش نافس فيها بجد.</p>
             <p>لما تسعّر بـ ١,٢٠٠+ ريال، انت بتغيّر المحادثة كلها. العميل مش هيقارنك بفيصل الدايل. هيقارنك ببراندات عالمية — وده بالظبط المكان اللي براند تراثي محترم لازم يكون فيه.</p>
         </div>
         """, unsafe_allow_html=True)
@@ -703,16 +797,16 @@ def tab_pricing():
         <div class="strategy-card arabic-block">
             <span class="label">الخطوة التانية · طقم التجربة</span>
             <h4 style='font-family: Tajawal; font-weight: 700;'>اطلق Discovery Set بـ ٣٥٠ – ٤٥٠ ريال.</h4>
-            <p>أربع عبوات صغيرة ٥ مل. بتقعد فوق فئة المبتدئين والمتوسطين كلها (فبتحافظ على الإحساس الفاخر)، وجوا الفئة الفاخرة اللي المنافس عنده فيها <b>٦ منتجات بس و ٦٩ مراجعة في المجموع</b>. العملاء اللي عايزين يصرفوا بين ٣٠٠ و ٤٠٠ ريال مش لاقيين عندهم حاجة يثقوا فيها. هيلاقوك انت.</p>
-            <p>الـ Discovery ده هو الجسر من التجربة لشراء العبوة الرئيسية بـ ١,٤٠٠ ريال — والمكان الوحيد المسموح فيه نتحرّك على السعر.</p>
+            <p>أربع عبوات صغيرة ٥ مل. بتقعد فوق فئة المبتدئين والمتوسطين (فبتحافظ على الإحساس الفاخر)، وجوا فئة ٢٥٠–٤٠٠ ريال اللي المنافس عنده فيها <b>{ar_num(F["n_premium"])} منتجات بس و {ar_num(F["reviews_premium"])} مراجعة في المجموع</b>. العميل اللي عايز يصرف بين ٣٠٠ و ٤٠٠ ريال قدامه اختيارات قليلة عند فيصل الدايل.</p>
+            <p>الـ Discovery ده هو الجسر من التجربة لشراء العبوة الرئيسية، والمكان الوحيد اللي يستاهل نتحرّك فيه على السعر.</p>
         </div>
         """, unsafe_allow_html=True)
 
         st.markdown(f"""
         <div class="strategy-card arabic-block">
             <span class="label">الخطوة التالتة · المنطقة الممنوعة</span>
-            <h4 style='font-family: Tajawal; font-weight: 700;'>لا تدخل فئة ١٤٢ – ٢٥٠ ريال أبدًا.</h4>
-            <p>سببين. الأول: مش هتقدر تكسب على الكمية ضد شركة عمرها ٢٤ سنة وعندها قنوات توزيع جاهزة. والتاني، الأهم: لما العميل يثبّت البراند في ذهنه على إنه بـ ٢٠٠ ريال، <b>مش هتقدر تطلع فوق تاني.</b> أبدًا.</p>
+            <h4 style='font-family: Tajawal; font-weight: 700;'>لا تدخل فئة {ar_num(fmt_price(F["min_price"]))} – ٢٥٠ ريال.</h4>
+            <p>سببين. الأول: مش هتقدر تكسب على الكمية ضد شركة موجودة من ٢٠٠٢، و{ar_num(f'{F["cash_share"]:.0%}')} من مراجعاتها في فئة {F["cash_tier_ar"]} ريال. والتاني، الأهم: لما العميل يثبّت البراند في ذهنه على إنه بـ ٢٠٠ ريال، <b>الطلوع لفوق بيبقى صعب جدًا.</b></p>
             <p>تنزل بسعرك بعدين، آه ممكن. تطلع بيه، صعب جدًا.</p>
         </div>
         """, unsafe_allow_html=True)
@@ -726,46 +820,56 @@ def tab_scent_gaps():
     st.markdown('<span class="eyebrow">Strategic Recommendation · Module 02</span>',
                 unsafe_allow_html=True)
     st.markdown("# Scent Gaps & Product Moat")
-    st.markdown(
-        '<p class="lede">The competitor uses oud, amber, and musk in nearly every product. '
-        "A heritage brand that smells the same loses by definition. A brand that smells different "
-        "is not compared — it is discovered.</p>",
-        unsafe_allow_html=True,
-    )
+    # ---- Note frequency, computed from product descriptions ----
+    described = df[df["has_text"]]
+    n_desc = len(described)
+    counts = (described["notes_list"].explode().dropna().value_counts().head(10))
+    notes_data = pd.DataFrame({"note": counts.index, "products": counts.values})
+    notes_data["share"] = notes_data["products"] / max(n_desc, 1)
 
-    # ---- Saturation chart ----
-    notes_data = pd.DataFrame({
-        "note": ["Oud", "Amber", "Musk", "Rose", "Frankincense",
-                 "Myrrh", "Vanilla", "Patchouli", "Jasmine", "Cardamom"],
-        "mentions": [82, 61, 56, 48, 45, 31, 31, 29, 25, 22],
-    })
-    fig = go.Figure(go.Bar(
-        x=notes_data["mentions"],
-        y=notes_data["note"],
-        orientation="h",
-        marker=dict(color=BRONZE, line=dict(color=BRONZE_DEEP, width=0)),
-        text=notes_data["mentions"],
-        textposition="outside",
-        textfont=dict(color=BONE, family="Manrope"),
-        hovertemplate="<b>%{y}</b><br>%{x} mentions across 75 products<extra></extra>",
-    ))
-    # Merge-then-pass pattern (see tab_pricing for why).
-    layout = {**PLOTLY_LAYOUT}
-    layout.update(
-        height=440,
-        title="The saturated Gulf palette — what every competitor builds with",
-        xaxis_title="Mentions across the 75-product catalog",
-        yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)",
-                   tickfont=dict(color=BONE)),
-        showlegend=False,
-    )
-    fig.update_layout(**layout)
-    st.plotly_chart(fig, use_container_width=True)
+    if len(notes_data) >= 3:
+        lead = ", ".join(
+            f"{r.note.lower()} ({r.share:.0%})" for r in notes_data.head(3).itertuples()
+        )
+        lede = (f"The competitor's most used notes are {lead} of described products. "
+                "A heritage brand that smells the same loses by definition. A brand that smells "
+                "different is not compared — it is discovered.")
+    else:
+        lede = ("A heritage brand that smells the same as the competition loses by definition. "
+                "A brand that smells different is not compared — it is discovered.")
+    st.markdown(f'<p class="lede">{lede}</p>', unsafe_allow_html=True)
+
+    if notes_data.empty:
+        st.info("No fragrance notes could be detected in this snapshot's product descriptions.")
+    else:
+        fig = go.Figure(go.Bar(
+            x=notes_data["products"],
+            y=notes_data["note"],
+            orientation="h",
+            marker=dict(color=BRONZE, line=dict(color=BRONZE_DEEP, width=0)),
+            text=[f"{p}  ({s:.0%})" for p, s in zip(notes_data["products"], notes_data["share"])],
+            textposition="outside",
+            textfont=dict(color=BONE, family="Manrope"),
+            hovertemplate=f"<b>%{{y}}</b><br>%{{x}} of {n_desc} described products<extra></extra>",
+        ))
+        # Merge-then-pass pattern (see tab_pricing for why).
+        layout = {**PLOTLY_LAYOUT}
+        layout.update(
+            height=440,
+            title="The competitor's palette: which notes show up most",
+            xaxis_title=f"Products mentioning the note (out of {n_desc} with a description)",
+            yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)",
+                       tickfont=dict(color=BONE)),
+            showlegend=False,
+        )
+        fig.update_layout(**layout)
+        st.plotly_chart(fig, width="stretch")
 
     st.markdown(
         '<p class="fineprint">'
-        'Eight ingredients carry the entire 75-product catalog. '
-        'This is the default Gulf perfume formula — replicable, recognizable, and saturated.'
+        f'Counted from the product descriptions: {n_desc} of {F["n"]} products have one. '
+        'A note counts once per product, and only as a whole word (so "السعودية" is not read as oud). '
+        'Descriptions do not always list every note, so treat these as lower bounds.'
         '</p>',
         unsafe_allow_html=True,
     )
@@ -778,7 +882,7 @@ def tab_scent_gaps():
         st.markdown(
             "The brand should be built around three categories of ingredients the competition "
             "does not use. We recommend a deliberate top–heart–base structure where every layer "
-            "sits outside the saturated palette above."
+            "sits outside the competitor's palette above."
         )
 
         st.markdown("""
@@ -828,7 +932,7 @@ def tab_scent_gaps():
         st.markdown(f"""
         <div class="arabic-block">
             <h2 style='font-family: Tajawal; font-weight: 700; border-bottom: 1px solid {INK_LINE}; padding-bottom: 0.6rem;'>استراتيجية المكونات الثلاثية</h2>
-            <p>البراند لازم يتبني حول ٣ فئات من المكونات اللي المنافس مش بيستخدمها. التوصية إن نعمل تركيبة مقصودة (نوتة عليا – قلب – قاعدة) كل طبقة فيها بره الباليتة المشبعة اللي فوق.</p>
+            <p>البراند لازم يتبني حول ٣ فئات من المكونات اللي المنافس مش بيستخدمها. التوصية إن نعمل تركيبة مقصودة (نوتة عليا – قلب – قاعدة) كل طبقة فيها بره باليتة المنافس اللي فوق.</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -873,23 +977,36 @@ def tab_pain_points():
                 unsafe_allow_html=True)
     st.markdown("# Customer Pain Points & Ad Hooks")
     st.markdown(
-        '<p class="lede">Three failure modes recur across Gulf luxury fragrance, '
-        "confirmed by industry-wide review patterns. Each pain point converts directly "
-        "into a launch hook the competitor cannot answer.</p>",
+        '<p class="lede">Three complaints that come up often in Gulf luxury fragrance. '
+        "Each one converts into a launch hook, if it holds for this market.</p>",
         unsafe_allow_html=True,
     )
 
-    # Three industry-verified pain points with three hook angles each
+    if lang == "English":
+        caveat = ("<b>Hypotheses, not findings.</b> These pain points come from common category "
+                  "complaints, not from this competitor's own reviews. Check them against the "
+                  "review evidence at the bottom of this page before spending on ads.")
+    else:
+        caveat = ("<b>دي فرضيات، مش نتايج.</b> نقط الألم دي جاية من شكاوى منتشرة في سوق العطور "
+                  "عمومًا، مش من مراجعات المنافس نفسه. راجعها مع أدلة المراجعات في آخر الصفحة "
+                  "قبل ما تصرف على إعلانات.")
+    st.markdown(
+        f'<div class="strategy-card{"" if lang == "English" else " arabic-block"}" '
+        f'style="border-left-color: {TERRACOTTA};"><p style="margin:0;">{caveat}</p></div>',
+        unsafe_allow_html=True,
+    )
+
+    # Three category-level pain points (hypotheses) with three hook angles each
     pain_points = [
         {
             "num": "01",
             "en_title": "Weak longevity and unstable sillage",
             "ar_title": "ضعف ثبات الريحة",
-            "en_desc": "The single most frequent complaint across Gulf fragrance reviews. "
+            "en_desc": "A frequent complaint in fragrance reviews across the category. "
                        "Customers report initial intensity that collapses within 1–3 hours, "
                        "leaving them re-applying mid-day or feeling deceived by an opening "
                        "that promised more than the drydown delivered.",
-            "ar_desc": "الشكوى الأكتر تكرارًا في مراجعات العطور الخليجية. "
+            "ar_desc": "من أكتر الشكاوى المنتشرة في مراجعات العطور عمومًا. "
                        "العميل بيقول إن الريحة قوية أول ما تتحط، بس بعد ساعة أو تلاتة "
                        "بتختفي — فيرجع يحط تاني نص النهار، أو يحس إن العطر خدعه.",
             "hooks_en": [
@@ -907,11 +1024,11 @@ def tab_pain_points():
             "num": "02",
             "en_title": "Generic, recycled scent profiles",
             "ar_title": "روايح متكررة ومتشابهة",
-            "en_desc": "Customers consistently complain that Gulf perfumes 'all smell the same' — "
+            "en_desc": "A common complaint is that Gulf perfumes 'all smell the same' — "
                        "oud, amber, musk, rose, on repeat. The fatigue of similarity is real, and "
                        "naming it openly in marketing creates instant trust with anyone who has "
                        "shopped this category twice.",
-            "ar_desc": "العملاء بيقولوا باستمرار إن العطور الخليجية كلها بريحة واحدة — "
+            "ar_desc": "شكوى منتشرة إن العطور الخليجية كلها بريحة واحدة — "
                        "عود، عنبر، مسك، ورد، نفس الدايرة. الإحساس بالملل من التشابه ده "
                        "حقيقي، ولما البراند يقوله بصراحة في الإعلان، بيكسب ثقة فورية "
                        "مع أي حد اشترى من الفئة دي أكتر من مرة.",
@@ -930,11 +1047,11 @@ def tab_pain_points():
             "num": "03",
             "en_title": "Fragile bottles and failing sprayers",
             "ar_title": "عبوات ضعيفة وبخّاخات بتتعطل",
-            "en_desc": "Persistent reports of leakage during shipping, sprayers that lose pressure "
+            "en_desc": "Common reports of leakage during shipping, sprayers that lose pressure "
                        "after weeks, and bottles that feel cheap at the price point being charged. "
                        "When a customer pays for luxury and receives industrial mechanics, the "
                        "experience contradicts the brand promise — and they tell people.",
-            "ar_desc": "بلاغات مستمرة عن تسرّب في الشحن، بخّاخات بتفقد ضغطها بعد أسابيع، "
+            "ar_desc": "بلاغات منتشرة عن تسرّب في الشحن، بخّاخات بتفقد ضغطها بعد أسابيع، "
                        "وعبوات بتحس إنها رخيصة بالنسبة لسعرها. لما العميل يدفع تمن فخامة "
                        "ويلاقي ميكانيكا صناعية، التجربة بتتناقض مع وعد البراند — وبيقول لأصحابه.",
             "hooks_en": [
@@ -1012,6 +1129,53 @@ def tab_pain_points():
         """, unsafe_allow_html=True)
 
 
+# Keywords for checking the pain-point hypotheses against real reviews
+REVIEW_THEMES = {
+    "01": ("Longevity / projection", "الثبات والفوحان",
+           r"ثبات|يثبت|ثابت|يطير|فواح|فوحان|longevity|lasting|projection|sillage"),
+    "02": ("Similarity to other scents", "التشابه مع عطور تانية",
+           r"يشبه|نفس الريحة|نفس الرائحة|مكرر|عادي|similar|same as|generic"),
+    "03": ("Bottle / sprayer / leakage", "العبوة والبخاخ والتسريب",
+           r"بخاخ|رشاش|تسريب|مسرب|العبوة|الزجاجة|الغطاء|spray|leak|bottle"),
+}
+
+
+def review_evidence():
+    st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
+    title = "Review Evidence" if lang == "English" else "أدلة من المراجعات"
+    st.markdown(f"## {title}")
+
+    reviews = [t for lst in df["reviews_list"] for t in lst]
+    if not reviews:
+        if lang == "English":
+            st.info(f"No review text in this snapshot ({F['snapshot']}): the review widget could "
+                    "not be read when this data was scraped. Run the scraper again "
+                    "(scraper/scrape_faisalaldayel.py) to collect the latest reviews per product, "
+                    "and this section will test each pain point against them.")
+        else:
+            st.info(f"مفيش نصوص مراجعات في النسخة دي من الداتا ({F['snapshot']}). شغّل الـ scraper تاني "
+                    "عشان يجمع آخر المراجعات لكل منتج، والقسم ده هيختبر كل نقطة ألم عليها.")
+        return
+
+    intro = (f"{len(reviews)} recent customer reviews collected across "
+             f"{int((df['reviews_list'].str.len() > 0).sum())} products. A mention is not a "
+             "complaint: read the examples to see which way each theme goes.")
+    if lang != "English":
+        intro = (f"{ar_num(len(reviews))} مراجعة حديثة من "
+                 f"{ar_num(int((df['reviews_list'].str.len() > 0).sum()))} منتج. "
+                 "ذكر الموضوع مش معناه شكوى: اقرا الأمثلة عشان تعرف الكلام رايح في أنهي اتجاه.")
+    st.markdown(intro)
+
+    s = pd.Series(reviews)
+    for num, (en, ar, pattern) in REVIEW_THEMES.items():
+        hits = s[s.str.contains(pattern, case=False, regex=True)]
+        label = en if lang == "English" else ar
+        st.markdown(f"**{num} · {label}**: {len(hits)} / {len(s)} ({len(hits) / len(s):.0%})")
+        for example in hits.head(3):
+            st.markdown(f"<div class='hook'>{html.escape(example[:220])}</div>",
+                        unsafe_allow_html=True)
+
+
 # ============================================================================
 # ROUTER
 # ============================================================================
@@ -1024,6 +1188,7 @@ elif section.startswith("🎯"):
     tab_scent_gaps()
 else:
     tab_pain_points()
+    review_evidence()
 
 
 # ============================================================================
